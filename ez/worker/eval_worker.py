@@ -18,7 +18,7 @@ from ez import mcts
 from ez.eval import eval
 
 # @ray.remote(num_gpus=0.05)
-@ray.remote(num_gpus=0.05)
+@ray.remote(num_gpus=0.10)
 class EvalWorker(Worker):
     def __init__(self, agent, replay_buffer, storage, config):
         super().__init__(0, agent, replay_buffer, storage, config)

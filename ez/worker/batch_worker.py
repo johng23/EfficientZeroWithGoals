@@ -24,7 +24,7 @@ from ez.utils.format import formalize_obs_lst, DiscreteSupport, LinearSchedule, 
 from ez.data.trajectory import GameTrajectory
 from ez.mcts.cy_mcts import Gumbel_MCTS
 
-@ray.remote(num_gpus=0.03)
+@ray.remote(num_gpus=0.07)
 # @ray.remote(num_gpus=0.14)
 class BatchWorker(Worker):
     def __init__(self, rank, agent, replay_buffer, storage, batch_storage, config):

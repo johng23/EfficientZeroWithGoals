@@ -9,6 +9,7 @@ import time
 import ray
 import torch
 import numpy as np
+np.int = int
 
 from torch.nn import L1Loss
 from pathlib import Path
@@ -21,7 +22,7 @@ from ez.utils.format import formalize_obs_lst, DiscreteSupport, allocate_gpu, pr
 from ez.mcts.cy_mcts import Gumbel_MCTS
 
 # @ray.remote(num_gpus=0.05)
-@ray.remote(num_gpus=0.05)
+@ray.remote(num_gpus=0.10)
 class DataWorker(Worker):
     def __init__(self, rank, agent, replay_buffer, storage, config):
         super().__init__(rank, agent, replay_buffer, storage, config)

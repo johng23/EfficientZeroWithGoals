@@ -2,7 +2,8 @@
 #
 # This source code is licensed under the GNU License, Version 3.0
 # found in the LICENSE file in the root directory of this source tree.
-
+import numpy as np
+np.int = int # yin
 import os
 import time
 os.environ["RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE"] = "1"
@@ -15,7 +16,6 @@ import multiprocessing
 import sys
 sys.path.append(os.getcwd())
 
-import numpy as np
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -54,7 +54,12 @@ def start_ddp_trainer(rank, config):
     manager = None
     num_gpus = torch.cuda.device_count()
     num_cpus = multiprocessing.cpu_count()
-    ray.init(num_gpus=num_gpus, num_cpus=num_cpus, object_store_memory=150 * 1024 * 1024 * 1024 if config.env.image_based else 100 * 1024 * 1024 * 1024)
+    # Define the path for Ray's temporary files, expanding the home directory symbol '~'
+    ray_temp_path = os.path.expanduser("~/ray_temp")
+    # Good practice to make sure the directory exists before Ray uses it
+    os.makedirs(ray_temp_path, exist_ok=True)
+    ray.init(address='auto')
+    #ray.init(num_gpus=num_gpus, num_cpus=num_cpus, object_store_memory=150 * 1024 * 1024 * 1024 if config.env.image_based else 100 * 1024 * 1024 * 1024, temp_dir=ray_temp_path,min_worker_port=20000,max_worker_port=29999,)
     set_seed(config.env.base_seed + rank >= 0)              # set seed
     # set log
 
