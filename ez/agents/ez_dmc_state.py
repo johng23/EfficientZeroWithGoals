@@ -650,15 +650,15 @@ class EZDMCStateAgent(Agent):
         self.pred_hid_shape = self.config.model.pred_hid_shape
         self.proj_shape = self.config.model.proj_shape
         self.pred_shape = self.config.model.pred_shape
+        self.noisy_net = self.config.model.noisy_net
 
         self._update = True
         self.use_bn = self.config.model.use_bn
         self.use_p_norm = self.config.model.use_p_norm
         self.noisy_net = self.config.model.noisy_net
-
+        
         # For your InjectionNetwork
         self.abstract_action_dim = self.config.model.abstract_action_dim
-        self.injection_net_shape = self.config.model.injection_net_shape
         self.injection_hidden_dim = self.config.model.injection_hidden_dim
 
         # For your GammaNetwork
@@ -753,7 +753,7 @@ class EZDMCStateAgent(Agent):
             value_policy_model,
             projection_model,
             projection_head_model,
-            injection_model,  # NEW
+            injection_model,
             self.config,
             state_norm=self.state_norm,
             value_prefix=self.value_prefix
