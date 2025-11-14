@@ -197,54 +197,47 @@ class RepresentationNetwork(nn.Module):
         return mean
 
 
-# Predict next hidden states given current states and actions
+# Predict next hidden states and other properties given current states and abstract actions
 class DynamicsNetwork(nn.Module):
     def __init__(
-        self,
-        hidden_shape,
-        action_shape,
-        num_blocks,
-        dyn_shape,
-        act_embed_shape,
-        rew_net_shape,
-        reward_support_size,
-        init_zero=False,
-        use_bn=True,
+            self,
+            hidden_shape,
+            abstract_action_shape,
+            real_action_dim,  # NEW: Added for the realization head
+            num_blocks,
+            dyn_shape,
+            act_embed_shape,
+            rew_net_shape,  # Hyperparameter for the reward head
+            reward_support_size,
+            gamma_net_shape,  # NEW: Hyperparameter for the gamma head
+            realization_net_shape,  # NEW: Hyperparameter for the realization head
+            init_zero=False,
+            use_bn=True,
     ):
-        """Dynamics network
-        Parameters
-        ----------
-        hidden_shape: int
-            dim of input hidden state
-        action_shape: int
-            dim of action
-        num_blocks: int
-            number of res blocks
-        dyn_shape: int
-            number of nodes of hidden layer
-        act_embed_shape: int
-            dim of action embedding
-        rew_net_shape: list
-            hidden layers of the reward prediction head (MLP head)
-        reward_support_size: int
-            dim of reward output
-        init_zero: bool
-            True -> zero initialization for the last layer of reward mlp
-        use_bn: bool
-            True -> Batch normalization
+        """
+        Dynamics network with four output heads:
+        1. Next State
+        2. Reward
+        3. Gamma (discount factor)
+        4. Realization (low-level action distribution)
         """
         super().__init__()
         self.hidden_shape = hidden_shape
 
-        self.act_linear1 = nn.Linear(action_shape, act_embed_shape)
+        # --- BODY: This part remains mostly the same ---
+        # It processes the state and abstract action into a shared representation.
+
+        # Abstract action embedding
+        self.act_linear1 = nn.Linear(abstract_action_shape, act_embed_shape)
         self.act_ln1 = nn.LayerNorm(act_embed_shape)
 
+        # Initial fusion and processing block
         self.dyn_ln_1 = nn.LayerNorm(hidden_shape + act_embed_shape)
         self.dyn_net_1 = nn.Linear(hidden_shape + act_embed_shape, dyn_shape)
-
         self.dyn_ln_2 = nn.LayerNorm(dyn_shape)
         self.dyn_net_2 = nn.Linear(dyn_shape, hidden_shape)
 
+        # Residual tower for deeper processing
         if num_blocks > 0:
             self.dyn_resblocks = nn.ModuleList(
                 [ImproveResidualBlock(hidden_shape, dyn_shape) for _ in range(num_blocks)]
@@ -252,98 +245,270 @@ class DynamicsNetwork(nn.Module):
         else:
             self.dyn_resblocks = nn.ModuleList([])
 
+        # --- HEADS: Four separate prediction heads branching from the body ---
 
-    def forward(self, hidden, action, reward_hidden=None):
+        # HEAD 1: Next State Prediction
+        # A simple linear layer to give this head its own parameters.
+        self.state_head = nn.Linear(hidden_shape, hidden_shape)
+
+        # HEAD 2: Reward Prediction
+        # This uses the same mlp helper as the original RewardNetwork.
+        self.reward_head = mlp(hidden_shape, rew_net_shape, reward_support_size,
+                               init_zero=init_zero, use_bn=use_bn)
+
+        # HEAD 3: Gamma Prediction
+        # An MLP followed by a Sigmoid to ensure the output is between 0 and 1.
+        self.gamma_head = nn.Sequential(
+            mlp(hidden_shape, gamma_net_shape, 1, use_bn=use_bn),
+            nn.Sigmoid()
+        )
+
+        # HEAD 4: Realization (Action Distribution) Prediction
+        # An MLP that outputs parameters for the action distribution.
+        self.realization_head = mlp(hidden_shape, realization_net_shape, real_action_dim * 2,
+                                    use_bn=use_bn)
+
+        # Store constants for post-processing the realization output
+        self.init_std = 1.0
+        self.min_std = 0.1
+
+    def forward(self, hidden, abstract_action):
+        # --- BODY FORWARD PASS ---
+        # This part remains the same. It produces a rich "processed_state".
 
         # action embedding
-        act_emb = self.act_linear1(action)
+        act_emb = self.act_linear1(abstract_action)
         act_emb = self.act_ln1(act_emb)
         act_emb = nn.functional.relu(act_emb)
-        # act_emb = nn.functional.tanh(act_emb)
 
-        # imporved res block 1st
+        # First residual block
         x = self.dyn_ln_1(torch.cat((hidden, act_emb), dim=-1))
         x = self.dyn_net_1(x)
         x = nn.functional.relu(x)
         x = self.dyn_net_2(x)
+        processed_state = hidden + x
 
-        state = hidden + x
-
-        # residual tower for dynamic model (2nd -> num blocks)
+        # Residual tower
         for block in self.dyn_resblocks:
-            state = block(state)
+            processed_state = block(processed_state)
 
-        # return state
-        return state
+        # --- HEADS FORWARD PASS ---
+        # Pass the single processed_state through all four heads.
 
+        # Head 1: Predict next state
+        next_state_pred = self.state_head(processed_state)
+
+        # Head 2: Predict reward
+        reward_pred = self.reward_head(processed_state)
+
+        # Head 3: Predict gamma
+        gamma_pred = self.gamma_head(processed_state)
+
+        # Head 4: Predict realization distribution parameters
+        realization_params = self.realization_head(processed_state)
+
+        # Post-process the realization parameters to be a valid distribution
+        action_dim = realization_params.shape[-1] // 2
+        realization_params[:, :action_dim] = 5 * torch.tanh(realization_params[:, :action_dim] / 5)
+        realization_params[:, action_dim:] = torch.nn.functional.softplus(
+            realization_params[:, action_dim:] + self.init_std) + self.min_std
+
+        # Return all four outputs as a tuple
+        return next_state_pred, reward_pred, gamma_pred, realization_params
+
+    # This helper function is less relevant now as it only inspects a small part of the network
     def get_dynamic_mean(self):
-
         mean = []
         for name, param in self.dyn_net_1.named_parameters():
             mean += np.abs(param.detach().cpu().numpy().reshape(-1)).tolist()
         mean = sum(mean) / len(mean)
-
         return mean
 
-
-class RewardNetwork(nn.Module):
-    def __init__(
-        self,
-        hidden_shape,
-        rew_net_shape,
-        reward_support_size,
-        init_zero=False,
-        use_bn=True,
-    ):
+# Takes actions to abstract actions
+class InjectionNetwork(nn.Module):
+    def __init__(self, action_dim, abstract_action_dim, hidden_dim, num_blocks):
         super().__init__()
-        self.hidden_shape = hidden_shape
-        self.rew_net_shape = rew_net_shape
-        self.reward_support_size = reward_support_size
-        self.rew_resblock = ImproveResidualBlock(self.hidden_shape, self.hidden_shape)
-        self.ln = nn.LayerNorm(self.hidden_shape)
-        self.rew_net = mlp(self.hidden_shape, self.rew_net_shape, self.reward_support_size,
-                           init_zero=init_zero,
-                           use_bn=use_bn)
+
+        # 1. Initial Projection Layer
+        self.initial_mlp = nn.Linear(action_dim, abstract_action_dim)
+        self.ln = nn.LayerNorm(abstract_action_dim)
+
+        # 2. Residual Tower (this makes it a "ResNet")
+        self.res_blocks = nn.ModuleList(
+            [ImproveResidualBlock(abstract_action_dim, hidden_dim) for _ in range(num_blocks)]
+        )
+
+    def forward(self, action):
+        # Pass through the initial projection
+        x = self.initial_mlp(action)
+        x = self.ln(x)
+        x = nn.functional.relu(x)  # Or tanh
+
+        # Pass through the stack of residual blocks
+        for block in self.res_blocks:
+            x = block(x)
+
+        return x
 
 
-    def forward(self, next_state):
-        next_state = self.rew_resblock(next_state)
-        next_state = self.ln(next_state)
-        reward = self.rew_net(next_state)
-        return reward
+# class GammaNetwork(nn.Module):
+#     """
+#     Predicts the learned discount factor (gamma) from a given hidden state.
+#     Its architecture mirrors the RewardNetwork for consistency.
+#     """
+#
+#     def __init__(
+#             self,
+#             hidden_shape,
+#             gamma_net_shape,  # e.g., [128] from config
+#             init_zero=False,
+#             use_bn=True,
+#     ):
+#         super().__init__()
+#
+#         # 1. Processing Block: A single residual block to process the input state.
+#         self.resblock = ImproveResidualBlock(hidden_shape, hidden_shape)
+#         self.ln = nn.LayerNorm(hidden_shape)
+#
+#         # 2. Final MLP Head: A standard MLP to produce the scalar output.
+#         self.net = mlp(
+#             input_size=hidden_shape,
+#             layer_sizes=gamma_net_shape,
+#             output_size=1,  # Output is a single scalar for gamma
+#             init_zero=init_zero,
+#             use_bn=use_bn
+#         )
+#
+#         # 3. Sigmoid activation to constrain the output between 0 and 1.
+#         self.sigmoid = nn.Sigmoid()
+#
+#     def forward(self, state):
+#         # Pass the state through the processing block first
+#         processed_state = self.resblock(state)
+#         processed_state = self.ln(processed_state)
+#         # processed_state = nn.functional.relu(processed_state)
+#
+#         # Predict the gamma logit from the processed state
+#         gamma_logit = self.net(processed_state)
+#
+#         # Apply sigmoid to get the final gamma value
+#         return self.sigmoid(gamma_logit)
 
-
-class RewardNetworkLSTM(nn.Module):
-    def __init__(
-        self,
-        hidden_shape,
-        rew_net_shape,
-        reward_support_size,
-        lstm_hidden_size,
-        init_zero=False,
-        use_bn=True,
-    ):
-        super().__init__()
-        self.hidden_shape = hidden_shape
-        self.rew_net_shape = rew_net_shape
-        self.reward_support_size = reward_support_size
-        self.rew_resblock = ImproveResidualBlock(self.hidden_shape, self.hidden_shape)
-        self.ln = nn.LayerNorm(self.hidden_shape)
-        self.lstm = nn.LSTM(input_size=self.hidden_shape, hidden_size=lstm_hidden_size)
-        self.rew_net = mlp(lstm_hidden_size, self.rew_net_shape, self.reward_support_size,
-                           init_zero=init_zero,
-                           use_bn=use_bn)
-
-    def forward(self, next_state, hidden):
-        next_state = self.rew_resblock(next_state)
-        next_state = self.ln(next_state)
-        next_state = next_state.unsqueeze(0)
-        reward, hidden = self.lstm(next_state, hidden)
-        reward = reward.squeeze(0)
-        reward = self.rew_net(reward)
-        return reward, hidden
-
-
+# class RewardNetwork(nn.Module):
+#     def __init__(
+#         self,
+#         hidden_shape,
+#         rew_net_shape,
+#         reward_support_size,
+#         init_zero=False,
+#         use_bn=True,
+#     ):
+#         super().__init__()
+#         self.hidden_shape = hidden_shape
+#         self.rew_net_shape = rew_net_shape
+#         self.reward_support_size = reward_support_size
+#         self.rew_resblock = ImproveResidualBlock(self.hidden_shape, self.hidden_shape)
+#         self.ln = nn.LayerNorm(self.hidden_shape)
+#         self.rew_net = mlp(self.hidden_shape, self.rew_net_shape, self.reward_support_size,
+#                            init_zero=init_zero,
+#                            use_bn=use_bn)
+#
+#
+#     def forward(self, next_state):
+#         next_state = self.rew_resblock(next_state)
+#         next_state = self.ln(next_state)
+#         reward = self.rew_net(next_state)
+#         return reward
+#
+#
+# class RewardNetworkLSTM(nn.Module):
+#     def __init__(
+#         self,
+#         hidden_shape,
+#         rew_net_shape,
+#         reward_support_size,
+#         lstm_hidden_size,
+#         init_zero=False,
+#         use_bn=True,
+#     ):
+#         super().__init__()
+#         self.hidden_shape = hidden_shape
+#         self.rew_net_shape = rew_net_shape
+#         self.reward_support_size = reward_support_size
+#         self.rew_resblock = ImproveResidualBlock(self.hidden_shape, self.hidden_shape)
+#         self.ln = nn.LayerNorm(self.hidden_shape)
+#         self.lstm = nn.LSTM(input_size=self.hidden_shape, hidden_size=lstm_hidden_size)
+#         self.rew_net = mlp(lstm_hidden_size, self.rew_net_shape, self.reward_support_size,
+#                            init_zero=init_zero,
+#                            use_bn=use_bn)
+#
+#     def forward(self, next_state, hidden):
+#         next_state = self.rew_resblock(next_state)
+#         next_state = self.ln(next_state)
+#         next_state = next_state.unsqueeze(0)
+#         reward, hidden = self.lstm(next_state, hidden)
+#         reward = reward.squeeze(0)
+#         reward = self.rew_net(reward)
+#         return reward, hidden
+#
+#
+# class RealizationNetwork(nn.Module):
+#     """
+#     Predicts the parameters of a low-level "real" action distribution from a given state.
+#
+#     Its architecture mirrors the RewardNetwork and GammaNetwork, using a residual block
+#     for initial state processing before the final MLP head.
+#     """
+#
+#     def __init__(
+#             self,
+#             hidden_shape,
+#             realization_net_shape,  # e.g., [256, 256] from config
+#             real_action_dim,
+#             use_bn=True,
+#             init_zero=False
+#     ):
+#         super().__init__()
+#
+#         # 1. Processing Block: A single residual block for initial processing.
+#         #    This makes it as complex as the Reward/Gamma networks.
+#         self.resblock = ImproveResidualBlock(hidden_shape, hidden_shape)
+#         self.ln = nn.LayerNorm(hidden_shape)
+#
+#         # 2. Final MLP Head: Produces the distribution parameters.
+#         self.net = mlp(
+#             input_size=hidden_shape,
+#             layer_sizes=realization_net_shape,
+#             output_size=real_action_dim * 2,  # For mean and std dev
+#             use_bn=use_bn,
+#             init_zero=init_zero
+#         )
+#
+#         # Store parameters for post-processing, ensuring the same output format
+#         # as the main policy network.
+#         self.init_std = 1.0
+#         self.min_std = 0.1
+#
+#     def forward(self, state):
+#         # 1. Pass the state through the processing block.
+#         processed_state = self.resblock(state)
+#         processed_state = self.ln(processed_state)
+#         processed_state = nn.functional.relu(processed_state)  # Consistent with Reward/Gamma heads
+#
+#         # 2. Get the raw outputs for the distribution from the MLP head.
+#         dist_params = self.net(processed_state)
+#
+#         # 3. Post-process the outputs to be valid mean and std dev.
+#         action_dim = dist_params.shape[-1] // 2
+#
+#         # Soft clamp the mean
+#         dist_params[:, :action_dim] = 5 * torch.tanh(dist_params[:, :action_dim] / 5)
+#
+#         # Ensure standard deviation is positive and has a minimum value
+#         dist_params[:, action_dim:] = torch.nn.functional.softplus(
+#             dist_params[:, action_dim:] + self.init_std) + self.min_std
+#
+#         return dist_params
 
 # predict the value and policy given hidden states
 class ValuePolicyNetwork(nn.Module):
@@ -491,6 +656,23 @@ class EZDMCStateAgent(Agent):
         self.use_p_norm = self.config.model.use_p_norm
         self.noisy_net = self.config.model.noisy_net
 
+        # For your InjectionNetwork
+        self.abstract_action_dim = self.config.model.abstract_action_dim
+        self.injection_net_shape = self.config.model.injection_net_shape
+        self.injection_hidden_dim = self.config.model.injection_hidden_dim
+
+        # For your GammaNetwork
+        self.gamma_net_shape = self.config.model.gamma_net_shape
+
+        # For your RealizationNetwork
+        self.realization_net_shape = self.config.model.realization_net_shape
+
+        # NEW: Read abstract action space config
+        self.abstract_action_dim = self.config.model.abstract_action_dim
+        self.injection_hidden_dim = self.config.model.injection_hidden_dim
+        self.gamma_net_shape = self.config.model.gamma_net_shape
+        self.realization_net_shape = self.config.model.realization_net_shape
+
     def build_model(self):
 
         representation_model = RepresentationNetwork(self.obs_shape, self.n_stack, self.num_blocks,
@@ -498,22 +680,50 @@ class EZDMCStateAgent(Agent):
                                                      use_bn=self.use_bn)
         value_output_size = self.config.model.value_support.size if self.config.model.value_support.type != 'symlog' else 1
         reward_output_size = self.config.model.reward_support.size if self.config.model.reward_support.type != 'symlog' else 1
-        dynamics_model = DynamicsNetwork(self.hidden_shape, self.action_space_size, self.num_blocks, self.dyn_shape,
-                                         self.act_embed_shape, self.rew_net_shape, reward_output_size,
-                                         use_bn=self.use_bn)
-        value_policy_model = ValuePolicyNetwork(self.hidden_shape, self.val_net_shape, self.pi_net_shape,
-                                                self.action_space_size, value_output_size,
-                                                init_zero=self.init_zero, use_bn=self.use_bn, p_norm=self.use_p_norm,
-                                                policy_distr=self.config.model.policy_distribution, noisy=self.noisy_net,
-                                                value_support=self.config.model.value_support,
-                                                v_num=self.v_num)
+        # dynamics_model = DynamicsNetwork(self.hidden_shape, self.action_space_size, self.num_blocks, self.dyn_shape,
+        #                                  self.act_embed_shape, self.rew_net_shape, reward_output_size,
+        #                                  use_bn=self.use_bn)
+        dynamics_model = DynamicsNetwork(
+            self.hidden_shape,
+            self.abstract_action_dim,  # Takes abstract actions
+            self.action_space_size,  # real_action_dim for realization head
+            self.num_blocks,
+            self.dyn_shape,
+            self.act_embed_shape,
+            self.rew_net_shape,
+            reward_output_size,
+            self.gamma_net_shape,
+            self.realization_net_shape,
+            init_zero=self.init_zero,
+            use_bn=self.use_bn
+        )
+        injection_model = InjectionNetwork(self.action_space_size, self.abstract_action_dim,
+                                           self.injection_hidden_dim, self.num_blocks)
+        # gamma_model = GammaNetwork(self.hidden_shape, self.gamma_net_shape)
+        # realization_model = RealizationNetwork(self.hidden_shape, self.realization_net_shape,
+        #                                        self.action_space_size)
+        # CHANGED: ValuePolicyNetwork now outputs abstract action distribution
+        value_policy_model = ValuePolicyNetwork(
+            self.hidden_shape,
+            self.val_net_shape,
+            self.pi_net_shape,
+            self.abstract_action_dim,  # CHANGED from self.action_space_size
+            value_output_size,
+            init_zero=self.init_zero,
+            use_bn=self.use_bn,
+            p_norm=self.use_p_norm,
+            policy_distr=self.config.model.policy_distribution,
+            noisy=self.noisy_net,
+            value_support=self.config.model.value_support,
+            v_num=self.v_num
+        )
 
-        if self.config.model.value_prefix:
-            reward_prediction_model = RewardNetworkLSTM(self.hidden_shape, self.rew_net_shape, reward_output_size, self.config.model.lstm_hidden_size,
-                                                        init_zero=self.init_zero, use_bn=self.use_bn)
-        else:
-            reward_prediction_model = RewardNetwork(self.hidden_shape, self.rew_net_shape, reward_output_size,
-                                                    init_zero=self.init_zero, use_bn=self.use_bn)
+        # if self.config.model.value_prefix:
+        #     reward_prediction_model = RewardNetworkLSTM(self.hidden_shape, self.rew_net_shape, reward_output_size, self.config.model.lstm_hidden_size,
+        #                                                 init_zero=self.init_zero, use_bn=self.use_bn)
+        # else:
+        #     reward_prediction_model = RewardNetwork(self.hidden_shape, self.rew_net_shape, reward_output_size,
+        #                                             init_zero=self.init_zero, use_bn=self.use_bn)
 
         projection_model = nn.Sequential(
             nn.Linear(self.hidden_shape, self.proj_hid_shape),
@@ -532,8 +742,21 @@ class EZDMCStateAgent(Agent):
             nn.Linear(self.pred_hid_shape, self.pred_shape),
         )
 
-        ez_model = EfficientZero(representation_model, dynamics_model, reward_prediction_model, value_policy_model,
-                                 projection_model, projection_head_model, self.config,
-                                 state_norm=self.state_norm, value_prefix=self.value_prefix)
+        # ez_model = EfficientZero(representation_model, dynamics_model, reward_prediction_model, value_policy_model,
+        #                          projection_model, projection_head_model, self.config,
+        #                          state_norm=self.state_norm, value_prefix=self.value_prefix)
+
+        # CHANGED: Pass injection_model to EfficientZero
+        ez_model = EfficientZero(
+            representation_model,
+            dynamics_model,
+            value_policy_model,
+            projection_model,
+            projection_head_model,
+            injection_model,  # NEW
+            self.config,
+            state_norm=self.state_norm,
+            value_prefix=self.value_prefix
+        )
 
         return ez_model
