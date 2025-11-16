@@ -10,6 +10,8 @@ import ray
 import torch
 import numpy as np
 
+np.int = int
+from ez.utils.distribution import SquashedNormal
 from torch.nn import L1Loss
 from pathlib import Path
 from torch.cuda.amp import autocast as autocast
@@ -20,8 +22,9 @@ from ez.envs import make_envs, make_env
 from ez.utils.format import formalize_obs_lst, DiscreteSupport, allocate_gpu, prepare_obs_lst, symexp
 from ez.mcts.cy_mcts import Gumbel_MCTS
 
+
 # @ray.remote(num_gpus=0.05)
-@ray.remote(num_gpus=0.05)
+@ray.remote(num_gpus=0.10)
 class DataWorker(Worker):
     def __init__(self, rank, agent, replay_buffer, storage, config):
         super().__init__(rank, agent, replay_buffer, storage, config)
@@ -54,18 +57,20 @@ class DataWorker(Worker):
         cur_seed = config.env.base_seed
 
         envs = make_envs(config.env.env, config.env.game, num_envs, cur_seed + self.rank * num_envs,
-                         save_path=video_path, episodic_life=config.env.episodic, **config.env)   # prev episodic_life=True
+                         save_path=video_path, episodic_life=config.env.episodic,
+                         **config.env)  # prev episodic_life=True
 
         # initialization
-        trained_steps = 0           # current training steps
-        collected_transitions = ray.get(self.replay_buffer.get_transition_num.remote())   # total transitions collected
-        start_training = False      # is training
+        trained_steps = 0  # current training steps
+        collected_transitions = ray.get(self.replay_buffer.get_transition_num.remote())  # total transitions collected
+        start_training = False  # is training
         max_transitions = config.data.total_transitions // config.actors.data_worker  # max transitions to collect in this worker
         dones = [False for _ in range(num_envs)]
         traj_len = [0 for _ in range(num_envs)]
 
         stack_obs_windows, game_trajs = self.agent.init_envs(envs, max_steps=self.config.data.trajectory_size)
-        prev_game_trajs = [None for _ in range(num_envs)]  # previous game trajectories (split a full game trajectory into several sub trajectories)
+        prev_game_trajs = [None for _ in range(
+            num_envs)]  # previous game trajectories (split a full game trajectory into several sub trajectories)
 
         # log data
         episode_return = [0. for _ in range(num_envs)]
@@ -84,7 +89,8 @@ class DataWorker(Worker):
                 continue
 
             # self-play is faster than training speed or finished
-            if start_training and (collected_transitions / max_transitions) > (trained_steps / self.config.train.training_steps):
+            if start_training and (collected_transitions / max_transitions) > (
+                    trained_steps / self.config.train.training_steps):
                 time.sleep(1)
                 continue
 
@@ -94,11 +100,12 @@ class DataWorker(Worker):
                     time.sleep(0.1)
                     continue
                 prev_train_steps = trained_steps
-                print(f'selfplay[{self.rank}] rollouts at step {trained_steps}, collected transitions {collected_transitions}')
+                print(
+                    f'selfplay[{self.rank}] rollouts at step {trained_steps}, collected transitions {collected_transitions}')
 
             # print('self-playing')
             # temperature
-            temperature = self.agent.get_temperature(trained_steps=trained_steps) #* np.ones((num_envs, 1))
+            temperature = self.agent.get_temperature(trained_steps=trained_steps)  # * np.ones((num_envs, 1))
 
             # stack obs
             current_stacked_obs = formalize_obs_lst(stack_obs_windows, image_based=config.env.image_based)
@@ -133,18 +140,44 @@ class DataWorker(Worker):
                                                                         # use_gumble_noise=False, # for test search
                                                                         temperature=temperature)
                 else:
-                    r_values, r_policies, best_actions, _ = tree.search_ori_mcts(self.model, num_envs, states, values, policies,
-                                                                                    use_noise=True, temperature=temperature)
+                    r_values, r_policies, best_actions, _ = tree.search_ori_mcts(self.model, num_envs, states, values,
+                                                                                 policies,
+                                                                                 use_noise=True,
+                                                                                 temperature=temperature)
             else:
                 r_values, r_policies, best_actions, sampled_actions, best_indexes, mcts_info = tree.search_continuous(
-                        self.model, num_envs, states, values, policies, temperature=temperature,
-                        # use_gumble_noise=True,
-                        input_noises=None 
-                    )
+                    self.model, num_envs, states, values, policies, temperature=temperature,
+                    # use_gumble_noise=True,
+                    input_noises=None
+                )
 
             # step action in environments
             for i in range(num_envs):
-                action = best_actions[i]
+                # John changed
+                # The 'best_actions' from MCTS are now abstract actions.
+                abstract_action = best_actions[i].unsqueeze(0)  # Ensure it has a batch dimension
+                current_state = states[i].unsqueeze(0)  # Ensure it has a batch dimension
+
+                # Get the parameters (mean, log_std) for the concrete action distribution
+                with torch.no_grad():
+                    realization_params = self.model.do_realization_prediction(current_state, abstract_action)
+
+                # --- NEW (Refined): Sample the concrete action using SquashedNormal logic ---
+                action_dim = realization_params.shape[-1] // 2
+                mean = realization_params[:, :action_dim]
+                std = realization_params[:, action_dim:]
+
+                # Create a distribution for the concrete action
+                # Assuming you have a SquashedNormal class available like in the sample_actions function
+                concrete_action_dist = SquashedNormal(mean, std)
+
+                # Sample a single concrete action
+                concrete_action = concrete_action_dist.sample()
+
+                # Convert to numpy for the environment step
+                # The output of SquashedNormal is already in the right range, so no clipping is needed.
+                action = concrete_action.squeeze(0).cpu().numpy()
+
                 obs, reward, done, info = envs[i].step(action)
                 dones[i] = done
                 traj_len[i] += 1
@@ -152,7 +185,7 @@ class DataWorker(Worker):
 
                 # save data to trajectory buffer
                 game_trajs[i].store_search_results(values[i], r_values[i], r_policies[i])
-                game_trajs[i].append(action, obs, reward)
+                game_trajs[i].append(action, abstract_action, concrete_action_dist, obs, reward)
                 # game_trajs[i].raw_obs_lst.append(obs)
                 if self.config.env.env == 'Atari':
                     game_trajs[i].snapshot_lst.append([])
@@ -177,7 +210,7 @@ class DataWorker(Worker):
                     game_trajs[i].init(stack_obs_windows[i])
 
                     traj_len[i] = 0
-    
+
                 # reset an env if done
                 if dones[i]:
                     # save the previous trajectory
@@ -202,7 +235,7 @@ class DataWorker(Worker):
                     # reset the finished env and new a env
                     if self.config.env.env == 'DMC':
                         envs[i] = make_env(config.env.env, config.env.game, num_envs, cur_seed + self.rank * num_envs,
-                             save_path=video_path, episodic_life=config.env.episodic, **config.env)
+                                           save_path=video_path, episodic_life=config.env.episodic, **config.env)
                     stacked_obs, traj = self.agent.init_env(envs[i], max_steps=self.config.data.trajectory_size)
                     stack_obs_windows[i] = stacked_obs
                     game_trajs[i] = traj
@@ -211,7 +244,6 @@ class DataWorker(Worker):
                     traj_len[i] = 0
                     episode_return[i] = 0
                 collected_transitions += 1
-
 
     def save_previous_trajectory(self, idx, prev_game_trajs, game_trajs, padding=True):
         """put the previous game trajectory into the pool if the current trajectory is full
@@ -229,7 +261,8 @@ class DataWorker(Worker):
             if self.config.model.value_target == 'bootstrapped':
                 gap_step = self.config.env.n_stack + self.config.rl.td_steps
             else:
-                extra = max(0, min(int(1 / (1 - self.config.rl.td_lambda)), self.config.model.GAE_max_steps) - self.config.rl.unroll_steps - 1)
+                extra = max(0, min(int(1 / (1 - self.config.rl.td_lambda)),
+                                   self.config.model.GAE_max_steps) - self.config.rl.unroll_steps - 1)
                 gap_step = self.config.env.n_stack + 1 + extra + 1
 
             beg_index = self.config.env.n_stack
@@ -262,7 +295,8 @@ class DataWorker(Worker):
                 target_values = torch.from_numpy(np.asarray(traj.get_gae_value())).cuda().float()
             else:
                 raise NotImplementedError
-            priorities = L1Loss(reduction='none')(pred_values[:traj_len], target_values[:traj_len]).detach().cpu().numpy() + self.config.priority.min_prior
+            priorities = L1Loss(reduction='none')(pred_values[:traj_len], target_values[
+                :traj_len]).detach().cpu().numpy() + self.config.priority.min_prior
         else:
             priorities = None
         self.traj_pool.append(traj)
@@ -270,6 +304,7 @@ class DataWorker(Worker):
         if len(self.traj_pool) >= self.pool_size:
             self.replay_buffer.save_pools.remote(self.traj_pool, priorities)
             del self.traj_pool[:]
+
 
 # ======================================================================================================================
 # data worker for self-play
