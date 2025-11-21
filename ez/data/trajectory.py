@@ -21,9 +21,12 @@ class GameTrajectory:
         self.pred_value_lst = []
         self.search_value_lst = []
         self.bootstrapped_value_lst = []
-        self.mc_value_lst = []
-        self.temp_obs = []
+        # self.mc_value_lst = []
+        # self.temp_obs = []
         self.snapshot_lst = []
+        # john changed
+        self.abstract_action_lst = []
+        self.concrete_action_dist_params_lst = []
 
         self.n_stack = kwargs.get('n_stack')
         self.discount = kwargs.get('discount')
@@ -44,13 +47,15 @@ class GameTrajectory:
         for obs in init_frames:
             self.obs_lst.append(copy.deepcopy(obs))
 
-    def append(self, action, obs, reward):
+    def append(self, concrete_action, abstract_action, concrete_action_dist_params, obs, reward):
         assert self.__len__() <= self.max_size
 
         # append a transition tuple
-        self.action_lst.append(action)
+        self.action_lst.append(concrete_action)
+        self.abstract_action_lst.append(abstract_action)  # <-- ADD THIS LINE
         self.obs_lst.append(obs)
         self.reward_lst.append(reward)
+        self.concrete_action_dist_params_lst.append(concrete_action_dist_params)
 
     def pad_over(self, tail_obs, tail_rewards, tail_pred_values, tail_search_values, tail_policies):
         """To make sure the correction of value targets, we need to add (o_t, r_t, etc) from the next history block
@@ -108,19 +113,22 @@ class GameTrajectory:
         self.pred_value_lst = np.array(self.pred_value_lst)
         self.search_value_lst = np.array(self.search_value_lst)
         self.bootstrapped_value_lst = np.array(self.bootstrapped_value_lst)
+        self.abstract_action_lst = np.array(self.abstract_action_lst)
+        self.concrete_action_dist_params_lst = np.array(self.concrete_action_dist_params_lst)
 
-    def make_target(self, index):
-        assert index < self.__len__()
-
-        target_obs = self.get_index_stacked_obs(index)
-        target_reward = self.reward_lst[index:index+self.unroll_steps+1]
-        target_pred_value = self.pred_value_lst[index:index+self.unroll_steps+1]
-        target_search_value = self.search_value_lst[index:index+self.unroll_steps+1]
-        target_bt_value = self.bootstrapped_value_lst[index:index+self.unroll_steps+1]
-        target_policy = self.policy_lst[index:index+self.unroll_steps+1]
-
-        assert len(target_reward) == len(target_pred_value) == len(target_search_value) == len(target_policy)
-        return np.array(target_obs), np.array(target_reward), np.array(target_pred_value), np.array(target_search_value), np.array(target_bt_value), np.array(target_policy)
+    # Dead code
+    # def make_target(self, index):
+    #     assert index < self.__len__()
+    #
+    #     target_obs = self.get_index_stacked_obs(index)
+    #     target_reward = self.reward_lst[index:index+self.unroll_steps+1]
+    #     target_pred_value = self.pred_value_lst[index:index+self.unroll_steps+1]
+    #     target_search_value = self.search_value_lst[index:index+self.unroll_steps+1]
+    #     target_bt_value = self.bootstrapped_value_lst[index:index+self.unroll_steps+1]
+    #     target_policy = self.policy_lst[index:index+self.unroll_steps+1]
+    #
+    #     assert len(target_reward) == len(target_pred_value) == len(target_search_value) == len(target_policy)
+    #     return np.array(target_obs), np.array(target_reward), np.array(target_pred_value), np.array(target_search_value), np.array(target_bt_value), np.array(target_policy)
 
     def store_search_results(self, pred_value, search_value, policy, idx: int = None):
         # store the visit count distributions and value of the root node after MCTS

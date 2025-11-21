@@ -170,7 +170,7 @@ class DataWorker(Worker):
                 # Create a distribution for the concrete action
                 # Assuming you have a SquashedNormal class available like in the sample_actions function
                 concrete_action_dist = SquashedNormal(mean, std)
-
+                concrete_action_dist_params = (mean, std)
                 # Sample a single concrete action
                 concrete_action = concrete_action_dist.sample()
 
@@ -185,7 +185,7 @@ class DataWorker(Worker):
 
                 # save data to trajectory buffer
                 game_trajs[i].store_search_results(values[i], r_values[i], r_policies[i])
-                game_trajs[i].append(action, abstract_action, concrete_action_dist, obs, reward)
+                game_trajs[i].append(action, abstract_action, concrete_action_dist_params, obs, reward)
                 # game_trajs[i].raw_obs_lst.append(obs)
                 if self.config.env.env == 'Atari':
                     game_trajs[i].snapshot_lst.append([])

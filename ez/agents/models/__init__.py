@@ -66,7 +66,9 @@ class EfficientZero(nn.Module):
             next_state = normalize_state(next_state)
 
         return next_state, reward, gamma, realization_params
-
+    def do_injection(self, state, action):
+        abstract_action = self.injection_model(state, action)
+        return abstract_action
     def do_realization_prediction(self, state, abstract_action):
         """
         Calls the dynamics model and returns only the parameters for the
@@ -149,10 +151,26 @@ class EfficientZero(nn.Module):
 
         return next_state, value_prefix, output_values, policy
 
-    def get_expected_reward_from_abstract_action(self, state, abstract_action, temperature):
-        realization_params = self.do_realization_prediction(state, abstract_action)
-
-        next_state, reward, gamma, realization_params = self.do_dynamics(state, abstract_action)
+    # def get_expected_reward_from_concrete_action(self, state, action):
+    #     # realization_params = self.do_realization_prediction(state, abstract_action)
+    #     abstract_action = self.do_injection(state, action)
+    #     next_state, reward, _, _ = self.do_dynamics(state, abstract_action)
+    #     return
+    # def get_expected_value_from_action_dist(self, state, realization_params):
+    #     # --- NEW (Refined): Sample the concrete action using SquashedNormal logic ---
+    #     action_dim = realization_params.shape[-1] // 2
+    #     mean = realization_params[:, :action_dim]
+    #     std = realization_params[:, action_dim:]
+    #
+    #     # Create a distribution for the concrete action
+    #     # Assuming you have a SquashedNormal class available like in the sample_actions function
+    #     concrete_action_dist = SquashedNormal(mean, std)
+    #     # Sample a single concrete action
+    #     concrete_action = concrete_action_dist.sample()
+    #
+    #     # Convert to numpy for the environment step
+    #     # The output of SquashedNormal is already in the right range, so no clipping is needed.
+    #     action = concrete_action.squeeze(0).cpu().numpy()
 
     def get_weights(self, part='none'):
         if part == 'reward':

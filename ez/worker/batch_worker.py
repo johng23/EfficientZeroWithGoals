@@ -24,7 +24,7 @@ from ez.utils.format import formalize_obs_lst, DiscreteSupport, LinearSchedule, 
 from ez.data.trajectory import GameTrajectory
 from ez.mcts.cy_mcts import Gumbel_MCTS
 
-@ray.remote(num_gpus=0.03)
+@ray.remote(num_gpus=0.07)
 # @ray.remote(num_gpus=0.14)
 class BatchWorker(Worker):
     def __init__(self, rank, agent, replay_buffer, storage, batch_storage, config):
@@ -64,10 +64,10 @@ class BatchWorker(Worker):
 
     def concat_trajs(self, items):
         obs_lsts, reward_lsts, policy_lsts, action_lsts, pred_value_lsts, search_value_lsts, \
-        bootstrapped_value_lsts = items
+        bootstrapped_value_lsts, abstract_action_lsts, concrete_action_dist_params_lsts = items
         traj_lst = []
-        for obs_lst, reward_lst, policy_lst, action_lst, pred_value_lst, search_value_lst, bootstrapped_value_lst in \
-                zip(obs_lsts, reward_lsts, policy_lsts, action_lsts, pred_value_lsts, search_value_lsts, bootstrapped_value_lsts):
+        for obs_lst, reward_lst, policy_lst, action_lst, pred_value_lst, search_value_lst, bootstrapped_value_lst, abstract_action_lst, concrete_action_dist_params_lst in \
+                zip(obs_lsts, reward_lsts, policy_lsts, action_lsts, pred_value_lsts, search_value_lsts, bootstrapped_value_lsts, abstract_action_lsts, concrete_action_dist_params_lsts):
             # traj = GameTrajectory(**self.config.env, **self.config.rl, **self.config.model)
             traj = GameTrajectory(
                 n_stack=self.n_stack, discount=self.discount, gray_scale=self.gray_scale, unroll_steps=self.unroll_steps,
@@ -81,6 +81,8 @@ class BatchWorker(Worker):
             traj.pred_value_lst = pred_value_lst
             traj.search_value_lst = search_value_lst
             traj.bootstrapped_value_lst = bootstrapped_value_lst
+            traj.abstract_action_lst = abstract_action_lst
+            traj.concrete_action_dist_params_lst = concrete_action_dist_params_lst
             traj_lst.append(traj)
         return traj_lst
 
@@ -163,6 +165,8 @@ class BatchWorker(Worker):
         collected_transitions = ray.get(self.replay_buffer.get_transition_num.remote())
         # make observations, actions and masks (if unrolled steps are out of trajectory)
         obs_lst, action_lst, mask_lst = [], [], []
+        # John New
+        abstract_action_lst, concrete_action_dist_params_lst = [], []
         top_new_masks = []
         # prepare the inputs of a batch
         for i in range(batch_size):
@@ -172,6 +176,7 @@ class BatchWorker(Worker):
 
             top_new_masks.append(int(sample_idx > collected_transitions - self.mixed_value_threshold))
 
+            concrete_action_dist_params_dim = 2 * self.action_space_size
             if self.env in ['DMC', 'Gym']:
                 _actions = traj.action_lst[state_index:state_index + self.unroll_steps]
                 _unroll_actions = traj.action_lst[state_index + 1:state_index + 1 + self.unroll_steps]
@@ -179,20 +184,53 @@ class BatchWorker(Worker):
                 _mask = [1. for _ in range(_unroll_actions.shape[0])]
                 _mask += [0. for _ in range(self.unroll_steps - len(_mask))]
                 _rand_actions = np.zeros((self.unroll_steps - _actions.shape[0], self.action_space_size))
+
                 _actions = np.concatenate((_actions, _rand_actions), axis=0)
+                # John New
+                # It should mirror the logic for the concrete actions exactly.
+                _abstract_actions = traj.abstract_action_lst[state_index:state_index + self.unroll_steps]
+                _concrete_action_dist_params = traj.concrete_action_dist_params_lst[state_index:state_index + self.unroll_steps]
+
+                # Pad with zero vectors if the slice was too short.
+                assert len(_abstract_actions) == len(_concrete_action_dist_params)
+                pad_len = self.unroll_steps - len(_abstract_actions)
+                if pad_len > 0:
+                    # The shape of the padding needs to match the abstract action dimension.
+                    # You'll need to access this from your config.
+                    padding_zeros_abstract_actions = np.zeros((pad_len, self.config.model.abstract_action_dim))
+                    _abstract_actions = np.concatenate((_abstract_actions, padding_zeros_abstract_actions), axis=0)
+                    padding_zeros_concrete_action_dist_params = np.zeros((pad_len, concrete_action_dist_params_dim))
+                    _concrete_action_dist_params = np.concatenate((_concrete_action_dist_params, padding_zeros_concrete_action_dist_params), axis=0)
             else:
                 _actions = traj.action_lst[state_index:state_index + self.unroll_steps].tolist()
                 _mask = [1. for _ in range(len(_actions))]
                 _mask += [0. for _ in range(self.unroll_steps - len(_mask))]
                 _actions += [np.random.randint(0, self.action_space_size) for _ in range(self.unroll_steps - len(_actions))]
+                # John New
+                # It should mirror the logic for the concrete actions exactly.
+                _abstract_actions = traj.abstract_action_lst[state_index:state_index + self.unroll_steps].tolist()
+                _concrete_action_dist_params = traj.concrete_action_dist_params_lst[state_index:state_index + self.unroll_steps].tolist()
 
+                # Pad with zero vectors if the slice was too short.
+                assert len(_abstract_actions) == len(_concrete_action_dist_params) and len(_actions) == len(_abstract_actions)
+                pad_len = self.unroll_steps - len(_actions)
+                if pad_len > 0:
+                    # The shape of the padding needs to match the abstract action dimension.
+                    # You'll need to access this from your config.
+                    padding_zeros_abstract_actions = np.random.randint(0,size = (pad_len, self.config.model.abstract_action_dim))
+                    _abstract_actions = np.concatenate((_abstract_actions, padding_zeros_abstract_actions), axis=0)
+                    padding_zeros_concrete_action_dist_params = np.random.randint(0,size = (pad_len, concrete_action_dist_params_dim))
+                    _concrete_action_dist_params = np.concatenate(
+                        (_concrete_action_dist_params, padding_zeros_concrete_action_dist_params), axis=0)
             # obtain the input observations
             obs_lst.append(traj.get_index_stacked_obs(state_index, padding=True))
             action_lst.append(_actions)
+            abstract_action_lst.append(_abstract_actions)
+            concrete_action_dist_params_lst.append(_concrete_action_dist_params)
             mask_lst.append(_mask)
 
         obs_lst = prepare_obs_lst(obs_lst, self.image_based)
-        inputs_batch = [obs_lst, action_lst, mask_lst, indices_lst, weights_lst, make_time_lst, prior_lst]
+        inputs_batch = [obs_lst, action_lst, abstract_action_lst, concrete_action_dist_params_lst, mask_lst, indices_lst, weights_lst, make_time_lst, prior_lst]
         for i in range(len(inputs_batch)):
             inputs_batch[i] = np.asarray(inputs_batch[i])
 
@@ -229,11 +267,11 @@ class BatchWorker(Worker):
         else:
             batch_policies_re = []
         # obtain the non-re policy
-        if batch_size - reanalyze_batch_size > 0:
-            batch_policies_non_re = self.prepare_policy_non_reanalyze(traj_lst[reanalyze_batch_size:],
-                                                                      transition_pos_lst[reanalyze_batch_size:])
-        else:
-            batch_policies_non_re = []
+        # if batch_size - reanalyze_batch_size > 0:
+        #     batch_policies_non_re = self.prepare_policy_non_reanalyze(traj_lst[reanalyze_batch_size:],
+        #                                                               transition_pos_lst[reanalyze_batch_size:])
+        # else:
+        #     batch_policies_non_re = []
         # concat target policy
         batch_policies = batch_policies_re
         if self.env in ['DMC', 'Gym']:
@@ -821,7 +859,7 @@ class BatchWorker(Worker):
             r_values, r_policies, best_actions, sampled_actions, search_best_indexes, _ = tree.search_continuous(
                     self.model,
                     batch_size, state_lst, value_lst, policy_lst, temperature=temperature,
-            ) 
+            )
 
         if self.config.train.optimal_Q:
             r_values = self.efficient_recurrent(state_lst, policy_lst)
@@ -870,104 +908,104 @@ class BatchWorker(Worker):
         policy_masks = np.asarray(policy_masks)
         return batch_policies, sampled_actions, best_actions, reanalyzed_values, (state_lst, value_lst, policy_lst, policy_mask), policy_masks
 
-    @torch.no_grad()
-    def imagine_episodes(self, pre_lst, traj_lst, transition_pos_lst, trained_steps, policy='search'):
-        length = 1
-        times = 3
-
-        # input_obs = np.concatenate([stack_obs for _ in range(times)], axis=0)
-        # states, values, policies = self.efficient_inference(input_obs)
-        states, values, policies, policy_mask = pre_lst
-        states = torch.cat([states for _ in range(times)], dim=0)
-        values = np.concatenate([values for _ in range(times)], axis=0)
-        policies = torch.cat([policies for _ in range(times)], dim=0)
-        reward_hidden = (torch.zeros(1, len(states), self.config.model.lstm_hidden_size).cuda(),
-                         torch.zeros(1, len(states), self.config.model.lstm_hidden_size).cuda())
-        last_values_prefixes = np.zeros(len(states))
-        reward_lst = []
-        value_lst = []
-        temperature = self.agent.get_temperature(trained_steps=trained_steps) * np.ones((len(states), 1))
-        for i in range(length):
-            if policy == 'search':
-                tree = mcts.names[self.config.mcts.language](
-                    num_actions=self.config.env.action_space_size if self.env == 'Atari' else self.config.mcts.num_top_actions,
-                    discount=self.config.rl.discount,
-                    **self.config.mcts,  # pass mcts related params
-                    **self.config.model,  # pass the value and reward support params
-                )
-                if self.env == 'Atari':
-                    if self.config.mcts.use_gumbel:
-                        r_values, r_policies, best_actions, _ = tree.search(
-                            self.model, len(states), states, values, policies,
-                            use_gumble_noise=True, temperature=temperature
-                        )
-                    else:
-                        r_values, r_policies, best_actions, _ = tree.search_ori_mcts(
-                            self.model, len(states), states, values, policies, use_noise=True,
-                            temperature=temperature, is_reanalyze=True
-                        )
-                else:
-                    r_values, r_policies, best_actions, sampled_actions, _, _ = tree.search_continuous(
-                        self.model, len(states), states, values, policies,
-                        use_gumble_noise=False, temperature=temperature)
-
-
-            if policy == 'search':
-                actions = torch.from_numpy(np.asarray(best_actions)).cuda().float()
-            else:
-                if self.env == 'Atari':
-                    actions = F.gumbel_softmax(policies, hard=True, dim=-1, tau=1e-4)
-                    actions = actions.argmax(dim=-1)
-                else:
-                    actions = policies[:, :policies.shape[-1]//2]
-                actions = actions.unsqueeze(1)
-
-            with autocast():
-                states, value_prefixes, values, policies, reward_hidden = \
-                    self.model.recurrent_inference(states, actions, reward_hidden)
-                values = values.squeeze().detach().cpu().numpy()
-                value_lst.append(values)
-            if self.value_prefix and (i + 1) % self.lstm_horizon_len == 0:
-                reward_hidden = (torch.zeros(1, len(states), self.config.model.lstm_hidden_size).cuda(),
-                                 torch.zeros(1, len(states), self.config.model.lstm_hidden_size).cuda())
-                true_rewards = value_prefixes.squeeze().detach().cpu().numpy()
-                # last_values_prefixes = np.zeros(len(states))
-            else:
-                true_rewards = value_prefixes.squeeze().detach().cpu().numpy() - last_values_prefixes
-                last_values_prefixes = value_prefixes.squeeze().detach().cpu().numpy()
-
-            reward_lst.append(true_rewards)
-
-        value = 0
-        for i, reward in enumerate(reward_lst):
-            value += reward * (self.config.rl.discount ** i)
-        value += (self.config.rl.discount ** length) * value_lst[-1]
-
-        value_reshaped = []
-        batch_size = len(states) // times
-        for i in range(times):
-            value_reshaped.append(value[batch_size * i:batch_size * (i+1)])
-
-        value_reshaped = np.asarray(value_reshaped).mean(0)
-        output_values = []
-        policy_index = 0
-        for traj, state_index in zip(traj_lst, transition_pos_lst):
-            imagined_values = []
-
-            for current_index in range(state_index, state_index + self.unroll_steps + 1):
-                traj_len = len(traj)
-
-                # assert (current_index < traj_len) == (policy_mask[policy_index])
-                if policy_mask[policy_index]:
-                    imagined_values.append(value_reshaped[policy_index])
-                else:
-                    imagined_values.append(0.0)
-
-                policy_index += 1
-
-            output_values.append(imagined_values)
-
-        return np.asarray(output_values)
+    # @torch.no_grad()
+    # def imagine_episodes(self, pre_lst, traj_lst, transition_pos_lst, trained_steps, policy='search'):
+    #     length = 1
+    #     times = 3
+    #
+    #     # input_obs = np.concatenate([stack_obs for _ in range(times)], axis=0)
+    #     # states, values, policies = self.efficient_inference(input_obs)
+    #     states, values, policies, policy_mask = pre_lst
+    #     states = torch.cat([states for _ in range(times)], dim=0)
+    #     values = np.concatenate([values for _ in range(times)], axis=0)
+    #     policies = torch.cat([policies for _ in range(times)], dim=0)
+    #     reward_hidden = (torch.zeros(1, len(states), self.config.model.lstm_hidden_size).cuda(),
+    #                      torch.zeros(1, len(states), self.config.model.lstm_hidden_size).cuda())
+    #     last_values_prefixes = np.zeros(len(states))
+    #     reward_lst = []
+    #     value_lst = []
+    #     temperature = self.agent.get_temperature(trained_steps=trained_steps) * np.ones((len(states), 1))
+    #     for i in range(length):
+    #         if policy == 'search':
+    #             tree = mcts.names[self.config.mcts.language](
+    #                 num_actions=self.config.env.action_space_size if self.env == 'Atari' else self.config.mcts.num_top_actions,
+    #                 discount=self.config.rl.discount,
+    #                 **self.config.mcts,  # pass mcts related params
+    #                 **self.config.model,  # pass the value and reward support params
+    #             )
+    #             if self.env == 'Atari':
+    #                 if self.config.mcts.use_gumbel:
+    #                     r_values, r_policies, best_actions, _ = tree.search(
+    #                         self.model, len(states), states, values, policies,
+    #                         use_gumble_noise=True, temperature=temperature
+    #                     )
+    #                 else:
+    #                     r_values, r_policies, best_actions, _ = tree.search_ori_mcts(
+    #                         self.model, len(states), states, values, policies, use_noise=True,
+    #                         temperature=temperature, is_reanalyze=True
+    #                     )
+    #             else:
+    #                 r_values, r_policies, best_actions, sampled_actions, _, _ = tree.search_continuous(
+    #                     self.model, len(states), states, values, policies,
+    #                     use_gumble_noise=False, temperature=temperature)
+    #
+    #
+    #         if policy == 'search':
+    #             actions = torch.from_numpy(np.asarray(best_actions)).cuda().float()
+    #         else:
+    #             if self.env == 'Atari':
+    #                 actions = F.gumbel_softmax(policies, hard=True, dim=-1, tau=1e-4)
+    #                 actions = actions.argmax(dim=-1)
+    #             else:
+    #                 actions = policies[:, :policies.shape[-1]//2]
+    #             actions = actions.unsqueeze(1)
+    #
+    #         with autocast():
+    #             states, value_prefixes, values, policies, reward_hidden = \
+    #                 self.model.recurrent_inference(states, actions, reward_hidden)
+    #             values = values.squeeze().detach().cpu().numpy()
+    #             value_lst.append(values)
+    #         if self.value_prefix and (i + 1) % self.lstm_horizon_len == 0:
+    #             reward_hidden = (torch.zeros(1, len(states), self.config.model.lstm_hidden_size).cuda(),
+    #                              torch.zeros(1, len(states), self.config.model.lstm_hidden_size).cuda())
+    #             true_rewards = value_prefixes.squeeze().detach().cpu().numpy()
+    #             # last_values_prefixes = np.zeros(len(states))
+    #         else:
+    #             true_rewards = value_prefixes.squeeze().detach().cpu().numpy() - last_values_prefixes
+    #             last_values_prefixes = value_prefixes.squeeze().detach().cpu().numpy()
+    #
+    #         reward_lst.append(true_rewards)
+    #
+    #     value = 0
+    #     for i, reward in enumerate(reward_lst):
+    #         value += reward * (self.config.rl.discount ** i)
+    #     value += (self.config.rl.discount ** length) * value_lst[-1]
+    #
+    #     value_reshaped = []
+    #     batch_size = len(states) // times
+    #     for i in range(times):
+    #         value_reshaped.append(value[batch_size * i:batch_size * (i+1)])
+    #
+    #     value_reshaped = np.asarray(value_reshaped).mean(0)
+    #     output_values = []
+    #     policy_index = 0
+    #     for traj, state_index in zip(traj_lst, transition_pos_lst):
+    #         imagined_values = []
+    #
+    #         for current_index in range(state_index, state_index + self.unroll_steps + 1):
+    #             traj_len = len(traj)
+    #
+    #             # assert (current_index < traj_len) == (policy_mask[policy_index])
+    #             if policy_mask[policy_index]:
+    #                 imagined_values.append(value_reshaped[policy_index])
+    #             else:
+    #                 imagined_values.append(0.0)
+    #
+    #             policy_index += 1
+    #
+    #         output_values.append(imagined_values)
+    #
+    #     return np.asarray(output_values)
 
     def efficient_inference(self, obs_lst, only_value=False, value_idx=0):
         batch_size = len(obs_lst)

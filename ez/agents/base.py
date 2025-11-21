@@ -29,6 +29,10 @@ from ez.utils.loss import kl_loss, cosine_similarity_loss, continuous_loss, syml
 from ez.data.trajectory import GameTrajectory
 from ez.data.augmentation import Transforms
 
+import torch.nn.functional as F
+from ez.utils.distribution import SquashedNormal
+
+
 def DDP_setup(**kwargs):
     # set master nod
     os.environ['MASTER_ADDR'] = kwargs.get('address')
@@ -36,11 +40,14 @@ def DDP_setup(**kwargs):
 
     # initialize the process group
     try:
-        dist.init_process_group('nccl', rank=kwargs.get('rank'), world_size=kwargs.get('world_size') * kwargs.get('training_size'))
+        dist.init_process_group('nccl', rank=kwargs.get('rank'),
+                                world_size=kwargs.get('world_size') * kwargs.get('training_size'))
     except:
-        dist.init_process_group('gloo', rank=kwargs.get('rank'), world_size=kwargs.get('world_size') * kwargs.get('training_size'))
+        dist.init_process_group('gloo', rank=kwargs.get('rank'),
+                                world_size=kwargs.get('world_size') * kwargs.get('training_size'))
 
     print(f'DDP backend={dist.get_backend()}')
+
 
 class Agent:
     def __init__(self, config):
@@ -115,10 +122,12 @@ class Agent:
             raise NotImplementedError
 
         if self.config.optimizer.lr_decay_type == 'cosine':
-            max_steps = self.config.train.training_steps - int(self.config.train.training_steps * self.config.optimizer.lr_warm_up)
+            max_steps = self.config.train.training_steps - int(
+                self.config.train.training_steps * self.config.optimizer.lr_warm_up)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_steps * 3, eta_min=0)
         elif self.config.optimizer.lr_decay_type == 'full_cosine':
-            max_steps = self.config.train.training_steps - int(self.config.train.training_steps * self.config.optimizer.lr_warm_up)
+            max_steps = self.config.train.training_steps - int(
+                self.config.train.training_steps * self.config.optimizer.lr_warm_up)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_steps // 2, eta_min=0)
         else:
             scheduler = None
@@ -191,7 +200,8 @@ class Agent:
                     time.sleep(1)
                     continue
 
-            scalers, log_data = self.update_weights(model, batch, optimizer, replay_buffer, scaler, step_count, target_model=target_model)
+            scalers, log_data = self.update_weights(model, batch, optimizer, replay_buffer, scaler, step_count,
+                                                    target_model=target_model)
             scaler = scalers[0]
 
             loss_data, other_scalar, other_distribution = log_data
@@ -218,10 +228,10 @@ class Agent:
                 left_steps = (self.config.train.training_steps + self.config.train.offline_training_steps - step_count)
                 left_time = (left_steps * avg_time) / 3600
                 batch_queue_size = batch_storage.get_len()
-                train_log_str = '[Train] {}, step {}/{}, {:.3f}h left. lr={:.3f}, avg time={:.3f}s, batchQ={}, '\
-                                'self-play return={:.3f}, collect {}/{:.3f}k, eval score={:.3f}/{:.3f}. '\
+                train_log_str = '[Train] {}, step {}/{}, {:.3f}h left. lr={:.3f}, avg time={:.3f}s, batchQ={}, ' \
+                                'self-play return={:.3f}, collect {}/{:.3f}k, eval score={:.3f}/{:.3f}. ' \
                                 'Loss: reward={:.3f}, value={:.3f}, policy={:.3f}, ' \
-                                'consistency={:.3f}, entropy={:.3f}'\
+                                'consistency={:.3f}, entropy={:.3f}' \
                                 ''.format(self.config.env.game, step_count, total_steps, left_time, lr, avg_time,
                                           batch_queue_size, self_play_reteurn, traj_num, transition_num / 1000,
                                           eval_score, eval_best_score, loss_data['loss/value_prefix'],
@@ -252,7 +262,8 @@ class Agent:
                 if len(eval_scalar) > 0:
                     eval_score = eval_scalar['eval/mean_score']
                     min_score, max_score = eval_scalar['eval/min_score'], eval_scalar['eval/max_score']
-                    eval_counter, eval_best_score = ray.get([storage.get_eval_counter.remote(), storage.get_best_score.remote()])
+                    eval_counter, eval_best_score = ray.get(
+                        [storage.get_eval_counter.remote(), storage.get_best_score.remote()])
 
                     eval_log_str = 'Eval {} at at step {}, score = {:.3f}(min: {:.3f}, max: {:.3f}), ' \
                                    'best score over past evaluation = {:.3f}' \
@@ -266,7 +277,8 @@ class Agent:
 
                 # replay statistics
                 traj_num, transition_num, total_priorities = ray.get([
-                    replay_buffer.get_traj_num.remote(), replay_buffer.get_transition_num.remote(), replay_buffer.get_priorities.remote()
+                    replay_buffer.get_traj_num.remote(), replay_buffer.get_transition_num.remote(),
+                    replay_buffer.get_priorities.remote()
                 ])
                 log_scalars.update({
                     'buffer/total_episode_num': traj_num,
@@ -296,7 +308,6 @@ class Agent:
                 'dist/priorities_in_buffer': total_priorities,
             })
             log_distribution.update(other_distribution)
-
 
         if is_main_process:
             final_weights = self.get_weights(model)
@@ -352,7 +363,11 @@ class Agent:
 
         # obtain the batch data
         inputs_batch, targets_batch = batch
-        obs_batch_ori, action_batch, mask_batch, indices, weights_lst, make_time, prior_lst = inputs_batch
+        obs_batch_ori, action_batch, abstract_action_lst, concrete_action_dist_params_lst, mask_batch, indices, weights_lst, make_time, prior_lst = inputs_batch
+        # batch_value_prefixes, batch_values, batch_actions, batch_policies, batch_best_actions, top_new_masks, policy_masks, reanalyzed_values
+
+        # Note that the actions here are actually abstract actions and the policies here are gaussian distribution parameters
+        # of the abstract actions
         target_value_prefixes, target_values, target_actions, target_policies, target_best_actions, \
             top_value_masks, mismatch_masks, search_values = targets_batch
         target_value_prefixes = target_value_prefixes[:, :unroll_steps]
@@ -364,7 +379,7 @@ class Agent:
             obs_batch_raw = torch.from_numpy(obs_batch_ori).cuda().float()
 
         obs_batch = obs_batch_raw[:, 0: n_stack * image_channel]  # obs_batch: current observation
-        obs_target_batch = obs_batch_raw[:, image_channel:]       # obs_target_batch: observation of next steps
+        obs_target_batch = obs_batch_raw[:, image_channel:]  # obs_target_batch: observation of next steps
         # if self.config.train.use_decorrelation:
         #     obs_batch_all = copy.deepcopy(obs_batch)
         #     for step_i in range(1, unroll_steps + 1):
@@ -380,6 +395,8 @@ class Agent:
         # others to gpu
         if self.config.env.env in ['DMC', 'Gym']:
             action_batch = torch.from_numpy(action_batch).float().cuda()
+            abstract_action_lst = torch.from_numpy(abstract_action_lst).float().cuda()
+            concrete_action_dist_params_lst = torch.from_numpy(concrete_action_dist_params_lst).float().cuda()
         else:
             action_batch = torch.from_numpy(action_batch).cuda().unsqueeze(-1).long()
         mask_batch = torch.from_numpy(mask_batch).cuda().float()
@@ -398,7 +415,8 @@ class Agent:
         max_value_target = torch.from_numpy(max_value_target).cuda().float()
 
         # transform value and reward to support
-        target_value_prefixes_support = DiscreteSupport.scalar_to_vector(target_value_prefixes, **self.config.model.reward_support)
+        target_value_prefixes_support = DiscreteSupport.scalar_to_vector(target_value_prefixes,
+                                                                         **self.config.model.reward_support)
 
         with autocast():
             states, values, policies = model.initial_inference(obs_batch, training=True)
@@ -410,7 +428,7 @@ class Agent:
         if self.config.env.env in ['DMC', 'Gym']:
             scaled_value = scaled_value.clip(0, 1e5)
 
-        # loss of first step 
+        # loss of first step
         # multi options (Value Loss)
         if self.config.train.value_target == 'sarsa':
             this_target_values = target_values
@@ -428,11 +446,13 @@ class Agent:
             raise NotImplementedError
 
         # update priority
-        fresh_priority = L1Loss(reduction='none')(scaled_value.squeeze(-1), this_target_values[:, 0]).detach().cpu().numpy()
+        fresh_priority = L1Loss(reduction='none')(scaled_value.squeeze(-1),
+                                                  this_target_values[:, 0]).detach().cpu().numpy()
         fresh_priority += self.config.priority.min_prior
         replay_buffer.update_priorities.remote(indices, fresh_priority, make_time)
 
         value_loss = torch.zeros(batch_size).cuda()
+
         value_loss += Value_loss(values, this_target_values[:, 0], self.config)
         prev_values = values.clone()
 
@@ -448,7 +468,7 @@ class Agent:
                 'dist/policy_mu': mu,
                 'dist/policy_sigma': sigma,
             })
- 
+
         else:
             policy_loss = kl_loss(policies, target_policies[:, 0])
             entropy_loss = torch.zeros(batch_size).cuda()
@@ -458,13 +478,22 @@ class Agent:
         policy_entropy_loss = torch.zeros(batch_size).cuda()
         policy_entropy_loss -= entropy_loss
 
+        gamma_consistency_loss = torch.zeros(batch_size).cuda()
+        concrete_action_dist_loss = torch.zeros(batch_size).cuda()
         prev_value_prefixes = torch.zeros_like(policy_loss)
+        abstract_concrete_value_loss = torch.zeros(batch_size).cuda()
+        gamma_consistency_loss = torch.zeros(batch_size).cuda()
+        concrete_action_dist_loss = torch.zeros(batch_size).cuda()
         # unroll k steps recurrently
         with autocast():
             for step_i in range(unroll_steps):
                 mask = mask_batch[:, step_i]
-                states, value_prefixes, values, policies, reward_hidden = model.recurrent_inference(states, action_batch[:, step_i], reward_hidden, training=True)
+                # _ for reward_hidden
+                # value_prefixes is currently rewards
+                action_embedding = model.injection_model(action_batch[:, step_i])
 
+                states, value_prefixes, values, policies, gamma_pred, realization_params, _ = model.recurrent_inference(
+                    states, action_embedding, reward_hidden, training=True)
                 beg_index = image_channel * step_i
                 end_index = image_channel * (step_i + n_stack)
 
@@ -475,7 +504,7 @@ class Agent:
                 dynamic_states_proj = model.do_projection(states, with_grad=True)
                 gt_states_proj = model.do_projection(gt_next_states, with_grad=False)
                 consistency_loss += cosine_similarity_loss(dynamic_states_proj, gt_states_proj) * mask
-  
+
                 # reward, value, policy loss
                 if self.config.model.reward_support.type == 'symlog':
                     value_prefix_loss += symlog_loss(value_prefixes, target_value_prefixes[:, step_i]) * mask
@@ -504,11 +533,130 @@ class Agent:
                 if self.config.model.value_prefix and (step_i + 1) % self.config.model.lstm_horizon_len == 0:
                     reward_hidden = self.init_reward_hidden(batch_size)
 
+                # Gamma consistency loss
+                # Get the ground-truth gamma value from the config (it's a scalar).
+                gt_gamma_val = self.config.rl.discount
+
+                # `gamma_pred` has shape [B, 1]. We need a target tensor of the same shape.
+                gt_gamma_tensor = torch.full_like(gamma_pred, gt_gamma_val)
+
+                # Calculate the Mean Squared Error for each item in the batch individually.
+                # `reduction='none'` gives a loss of shape [B, 1].
+                loss_step_gamma = F.mse_loss(gamma_pred, gt_gamma_tensor, reduction='none')
+
+                # `loss_step_gamma` is [B, 1] and `mask` is [B]. To multiply them,
+                # we need to make their shapes compatible. We can either unsqueeze the mask
+                # or squeeze the loss. Squeezing is common.
+                # This results in a tensor of shape [B].
+                loss_step_gamma_masked = loss_step_gamma.squeeze() * mask
+
+                # Accumulate the loss for this step.
+                gamma_consistency_loss += loss_step_gamma_masked
+
+                # Concrete action distribution loss
+
+                # To call continuous_loss, we need to create fillers for the unused arguments.
+
+                # For target_best_action, this is our main target.
+                filler_target_best_action = action_batch[:, step_i]
+
+                # For target_action, which is a list of candidate actions.
+                # We can make it a list containing only our one best action.
+                # Shape needs to be [num_candidates, batch, action_dim]
+                filler_target_action = action_batch[:, step_i].unsqueeze(0)
+
+                # For target_policy, which is the probability for each candidate.
+                # We have one candidate with probability 1.0.
+                # Shape needs to be [batch, num_candidates]
+                filler_target_policy = torch.ones(action_batch[:, step_i].shape[0], 1).cuda()
+
+                # This uses continuous_loss in a poorly designed way, but it achieves what we want. We just want the realization params
+                # to be nudged towards predicting filler_target_best_action
+                loss_step_action, _ = continuous_loss(
+                    policy=realization_params,
+                    target_action=filler_target_action,
+                    target_policy=filler_target_policy,
+                    target_best_action=filler_target_best_action,
+                    mask=mask,
+                    distribution_type=self.config.model.policy_distribution
+                )
+
+                concrete_action_dist_loss += loss_step_action * mask
+
+                # Abstract action value consistency update
+                # 'states' is the current state in the unroll, s_i
+                # We just called recurrent_inference with the abstract action to get these outputs:
+                # value_prefixes: Logits for r(s_i, abstract_a_i), shape [B, S_r]
+                # values: Logits for V(s_{i+1}), shape [V, B, S_v]
+                # gamma_pred: Predicted γ, shape [B, 1]
+                #
+                # Convert all predictions to scalar values.
+                scalar_rewards = DiscreteSupport.vector_to_scalar(value_prefixes, **self.config.model.reward_support)
+                scalar_values = DiscreteSupport.vector_to_scalar(values.mean(dim=0), **self.config.model.value_support)
+
+                # Calculate the LHS. All tensors are now scalars. Shape [B, 1].
+                LHS = scalar_rewards + gamma_pred * scalar_values
+
+                num_samples = self.config.model.abstract_concrete_alignment_samples  # Configurable number of samples for the expectation
+
+                # 'realization_params' has shape [B, 2 * action_dim]
+                action_dim = realization_params.shape[-1] // 2
+                mean = realization_params[:, :action_dim]
+                std = realization_params[:, action_dim:]
+
+                # Create the distribution for sampling concrete actions
+                realization_dist = SquashedNormal(mean, std)
+
+                # Sample 'k' actions. Use .rsample() to ensure gradients can flow if needed (though we will detach).
+                # Shape: [num_samples, B, action_dim]
+                sampled_actions = realization_dist.rsample(torch.Size([num_samples]))
+
+                rhs_values = []
+                # Loop to calculate the RHS for each of the k samples
+                for k in range(num_samples):
+                    concrete_action_k = sampled_actions[k]  # Shape [B, action_dim]
+
+                    # Use the CURRENT model's components to calculate the value of this concrete action.
+
+                    # 1. Embed the concrete action
+                    action_embedding = model.injection_model(concrete_action_k)
+
+                    # 2. Predict the outcome with the dynamics model
+                    # We use the same 'states' (s_i) from the start of the unroll step.
+                    d_next_state, d_reward_logits, d_gamma_pred, d_concrete_action_dist = model.dynamics_model(
+                        states.detach(), action_embedding)
+
+                    # 3. Predict the value of the resulting state
+                    d_value_logits, _ = model.value_policy_model(d_next_state)
+
+                    # 4. Convert predictions to scalars
+                    scalar_d_reward = DiscreteSupport.vector_to_scalar(d_reward_logits,
+                                                                       **self.config.model.reward_support)
+                    scalar_d_value = DiscreteSupport.vector_to_scalar(d_value_logits.mean(dim=0),
+                                                                      **self.config.model.value_support)
+
+                    # 5. Calculate the one-step Bellman update for this sample
+                    rhs_k = scalar_d_reward + self.config.rl.discount * scalar_d_value
+                    rhs_values.append(rhs_k)
+
+                # Approximate the expectation by taking the mean over the samples.
+                # Shape: [B, 1]
+                RHS = torch.stack(rhs_values).mean(dim=0)
+                # Initialize at the top of update_weights:
+                abstract_concrete_value_loss = torch.zeros(batch_size).cuda()
+
+                # Inside the loop:
+                # As we discussed, detach the RHS to create a stable target.
+                loss_step = F.mse_loss(LHS, RHS.detach(), reduction='none').squeeze()
+
+                abstract_concrete_value_loss += loss_step * mask
         # total loss
+
         loss = (value_prefix_loss * self.config.train.reward_loss_coeff
                 + value_loss * self.config.train.value_loss_coeff
                 + policy_loss * self.config.train.policy_loss_coeff
-                + consistency_loss * self.config.train.consistency_coeff)
+                + consistency_loss * self.config.train.consistency_coeff
+                + abstract_concrete_value_loss * self.config.train.abstract_concrete_value_loss_coeff)
 
         if self.config.env.env in ['DMC', 'Gym']:
             loss += policy_entropy_loss * self.config.train.entropy_coeff
@@ -585,12 +733,12 @@ class Agent:
             if self.config.optimizer.lr_decay_type == 'cosine':
                 if scheduler is not None:
                     scheduler.step()
-                lr = scheduler.get_last_lr()[0] # return a list
+                lr = scheduler.get_last_lr()[0]  # return a list
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = lr
             else:
                 lr = optimize_config.lr * optimize_config.lr_decay_rate ** (
-                            (step_count - lr_warm_step) // optimize_config.lr_decay_steps)
+                        (step_count - lr_warm_step) // optimize_config.lr_decay_steps)
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = lr
 
@@ -618,9 +766,9 @@ class Agent:
         if self.config.train.change_temperature:
             total_steps = self.config.train.training_steps + self.config.train.offline_training_steps
             # if self.config.env.env == 'Atari':
-            if trained_steps < 0.5 * total_steps:   # prev 0.5
+            if trained_steps < 0.5 * total_steps:  # prev 0.5
                 return 1.0
-            elif trained_steps < 0.75 * total_steps:    # prev 0.75
+            elif trained_steps < 0.75 * total_steps:  # prev 0.75
                 return 0.5
             else:
                 return 0.25
@@ -715,7 +863,8 @@ def train_ddp(agent, rank, replay_buffer, storage, batch_storage, logger):
 
     # DDP
     if agent.use_ddp:
-        DDP_setup(rank=rank, world_size=agent.config.ddp.world_size, training_size=agent.config.ddp.training_size, address='127.0.0.1')
+        DDP_setup(rank=rank, world_size=agent.config.ddp.world_size, training_size=agent.config.ddp.training_size,
+                  address='127.0.0.1')
         model = DDP(model, device_ids=[rank])
 
     if int(torch.__version__[0]) == 2:
@@ -742,10 +891,12 @@ def train_ddp(agent, rank, replay_buffer, storage, batch_storage, logger):
         raise NotImplementedError
 
     if agent.config.optimizer.lr_decay_type == 'cosine':
-        max_steps = agent.config.train.training_steps - int(agent.config.train.training_steps * agent.config.optimizer.lr_warm_up)
+        max_steps = agent.config.train.training_steps - int(
+            agent.config.train.training_steps * agent.config.optimizer.lr_warm_up)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_steps * 3, eta_min=0)
     elif agent.config.optimizer.lr_decay_type == 'full_cosine':
-        max_steps = agent.config.train.training_steps - int(agent.config.train.training_steps * agent.config.optimizer.lr_warm_up)
+        max_steps = agent.config.train.training_steps - int(
+            agent.config.train.training_steps * agent.config.optimizer.lr_warm_up)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_steps // 2, eta_min=0)
     else:
         scheduler = None
@@ -810,8 +961,8 @@ def train_ddp(agent, rank, replay_buffer, storage, batch_storage, logger):
             target_model.eval()
             recent_weights = agent.get_weights(model)
 
-
-        scalers, log_data = agent.update_weights(model.module, batch, optimizer, replay_buffer, scaler, step_count, target_model=target_model)
+        scalers, log_data = agent.update_weights(model.module, batch, optimizer, replay_buffer, scaler, step_count,
+                                                 target_model=target_model)
         scaler = scalers[0]
 
         loss_data, other_scalar, other_distribution = log_data
@@ -838,10 +989,10 @@ def train_ddp(agent, rank, replay_buffer, storage, batch_storage, logger):
             left_steps = (agent.config.train.training_steps + agent.config.train.offline_training_steps - step_count)
             left_time = (left_steps * avg_time) / 3600
             batch_queue_size = batch_storage.get_len()
-            train_log_str = '[Train] {}, step {}/{}, {:.3f}h left. lr={:.3f}, avg time={:.3f}s, batchQ={}, '\
-                            'agent-play return={:.3f}, collect {}/{:.3f}k, eval score={:.3f}/{:.3f}. '\
+            train_log_str = '[Train] {}, step {}/{}, {:.3f}h left. lr={:.3f}, avg time={:.3f}s, batchQ={}, ' \
+                            'agent-play return={:.3f}, collect {}/{:.3f}k, eval score={:.3f}/{:.3f}. ' \
                             'Loss: reward={:.3f}, value={:.3f}, policy={:.3f}, ' \
-                            'consistency={:.3f}, entropy={:.3f}'\
+                            'consistency={:.3f}, entropy={:.3f}' \
                             ''.format(agent.config.env.game, step_count, total_steps, left_time, lr, avg_time,
                                       batch_queue_size, self_play_reteurn, traj_num, transition_num / 1000,
                                       eval_score, eval_best_score, loss_data['loss/value_prefix'],
@@ -876,7 +1027,8 @@ def train_ddp(agent, rank, replay_buffer, storage, batch_storage, logger):
 
                 eval_score = eval_scalar['eval/mean_score']
                 min_score, max_score = eval_scalar['eval/min_score'], eval_scalar['eval/max_score']
-                eval_counter, eval_best_score = ray.get([storage.get_eval_counter.remote(), storage.get_best_score.remote()])
+                eval_counter, eval_best_score = ray.get(
+                    [storage.get_eval_counter.remote(), storage.get_best_score.remote()])
 
                 eval_log_str = 'Eval {} at at step {}, score = {:.3f}(min: {:.3f}, max: {:.3f}), ' \
                                'best score over past evaluation = {:.3f}' \
@@ -887,7 +1039,8 @@ def train_ddp(agent, rank, replay_buffer, storage, batch_storage, logger):
 
             # replay statistics
             traj_num, transition_num, total_priorities = ray.get([
-                replay_buffer.get_traj_num.remote(), replay_buffer.get_transition_num.remote(), replay_buffer.get_priorities.remote()
+                replay_buffer.get_traj_num.remote(), replay_buffer.get_transition_num.remote(),
+                replay_buffer.get_priorities.remote()
             ])
             log_scalars.update({
                 'buffer/total_episode_num': traj_num,
@@ -917,7 +1070,6 @@ def train_ddp(agent, rank, replay_buffer, storage, batch_storage, logger):
             'dist/priorities_in_buffer': total_priorities,
         })
         log_distribution.update(other_distribution)
-
 
     final_weights = agent.get_weights(model)
     storage.set_weights.remote(final_weights, 'self_play')

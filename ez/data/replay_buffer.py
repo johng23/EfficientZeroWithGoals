@@ -9,6 +9,7 @@ import numpy as np
 import ray
 import pickle
 
+
 @ray.remote
 class ReplayBuffer:
     def __init__(self, **kwargs):
@@ -41,14 +42,15 @@ class ReplayBuffer:
             assert len(traj) == len(priorities), " priorities should be of same length as the game steps"
             priorities = priorities.copy().reshape(-1)
             max_prio = self.priorities.max() if self.buffer else 1
-            self.priorities = np.concatenate((self.priorities, [max(max_prio, priorities.max()) for i in range(traj_len)]))
+            self.priorities = np.concatenate(
+                (self.priorities, [max(max_prio, priorities.max()) for i in range(traj_len)]))
 
         for snapshot in traj.snapshot_lst:
             self.snapshots.append(snapshot)
 
         self.buffer.append(traj)
-        self.transition_idx_look_up += [(self.base_idx + len(self.buffer) - 1, step_pos) for step_pos in range(traj_len)]
-
+        self.transition_idx_look_up += [(self.base_idx + len(self.buffer) - 1, step_pos) for step_pos in
+                                        range(traj_len)]
 
     def get_item(self, idx):
         traj_idx, state_index = self.transition_idx_look_up[idx]
@@ -64,7 +66,8 @@ class ReplayBuffer:
 
         return batch_context
 
-    def _prepare_batch_context_supervised(self, batch_size, alpha=None, beta=None, is_validation=False, force_uniform=False):
+    def _prepare_batch_context_supervised(self, batch_size, alpha=None, beta=None, is_validation=False,
+                                          force_uniform=False):
         transition_num = self.get_transition_num()
         if is_validation:
             validation_set = np.arange(int(transition_num * 0.95), transition_num)
@@ -100,11 +103,10 @@ class ReplayBuffer:
                    transition_num, self.priorities[indices_lst]]
         return context
 
-
     def _prepare_batch_context(self, batch_size, alpha, beta):
 
         transition_num = self.get_transition_num()
-        
+
         # sample data
         if self.use_priority:
             probs = self.priorities ** alpha
@@ -124,7 +126,7 @@ class ReplayBuffer:
         # weight
         weights_lst = (transition_num * probs[indices_lst]) ** (-beta)
         weights_lst = weights_lst / weights_lst.max()
-        weights_lst = weights_lst.clip(0.1, 1)    # TODO: try weights clip, prev 0.1
+        weights_lst = weights_lst.clip(0.1, 1)  # TODO: try weights clip, prev 0.1
 
         traj_lst, transition_pos_lst = [], []
         # obtain the
@@ -135,12 +137,13 @@ class ReplayBuffer:
 
         make_time_lst = [time.time() for _ in range(len(indices_lst))]
 
-        context = [self.split_trajs(traj_lst), transition_pos_lst, indices_lst, weights_lst, make_time_lst, transition_num, self.priorities[indices_lst]]
+        context = [self.split_trajs(traj_lst), transition_pos_lst, indices_lst, weights_lst, make_time_lst,
+                   transition_num, self.priorities[indices_lst]]
         return context
 
     def split_trajs(self, traj_lst):
         obs_lsts, reward_lsts, policy_lsts, action_lsts, pred_value_lsts, search_value_lsts, \
-        bootstrapped_value_lsts, snapshot_lsts = [], [], [], [], [], [], [], []
+            bootstrapped_value_lsts, snapshot_lsts, abstract_action_lsts, concrete_action_dist_params_lsts = [], [], [], [], [], [], [], [], [], []
         for traj in traj_lst:
             obs_lsts.append(traj.obs_lst)
             reward_lsts.append(traj.reward_lst)
@@ -150,20 +153,25 @@ class ReplayBuffer:
             search_value_lsts.append(traj.search_value_lst)
             bootstrapped_value_lsts.append(traj.bootstrapped_value_lst)
             snapshot_lsts.append(traj.snapshot_lst)
-        return [obs_lsts, reward_lsts, policy_lsts, action_lsts, pred_value_lsts, search_value_lsts, bootstrapped_value_lsts,
+            abstract_action_lsts.append(traj.abstract_action_lst)
+            concrete_action_dist_params_lsts.append(traj.concrete_action_dist_params_lst)
+        return [obs_lsts, reward_lsts, policy_lsts, action_lsts, pred_value_lsts, search_value_lsts,
+                bootstrapped_value_lsts,
                 # snapshot_lsts
+                abstract_action_lsts,
+                concrete_action_dist_params_lsts
                 ]
 
-    def update_root_values(self, batch_indices, search_values, transition_positions, unroll_steps):
-        val_idx = 0
-        for idx, pos in zip(batch_indices, transition_positions):
-            traj_idx, state_index = self.transition_idx_look_up[idx]
-            traj_idx -= self.base_idx
-            for i in range(unroll_steps + 1):
-                self.buffer[traj_idx].search_value_lst.setflags(write=True)
-                if pos + i < len(self.buffer[traj_idx].search_value_lst):
-                    self.buffer[traj_idx].search_value_lst[pos + i] = search_values[val_idx][i]
-            val_idx += 1
+    # def update_root_values(self, batch_indices, search_values, transition_positions, unroll_steps):
+    #     val_idx = 0
+    #     for idx, pos in zip(batch_indices, transition_positions):
+    #         traj_idx, state_index = self.transition_idx_look_up[idx]
+    #         traj_idx -= self.base_idx
+    #         for i in range(unroll_steps + 1):
+    #             self.buffer[traj_idx].search_value_lst.setflags(write=True)
+    #             if pos + i < len(self.buffer[traj_idx].search_value_lst):
+    #                 self.buffer[traj_idx].search_value_lst[pos + i] = search_values[val_idx][i]
+    #         val_idx += 1
 
     def update_priorities(self, batch_indices, batch_priorities, make_time, mask=None):
         # update the priorities for data still in replay buffer
@@ -179,11 +187,11 @@ class ReplayBuffer:
     def get_priorities(self):
         return self.priorities
 
-    def get_snapshots(self, indices_lst):
-        selected_snapshots = []
-        for idx in indices_lst:
-            selected_snapshots.append(self.snapshots[idx])
-        return selected_snapshots
+    # def get_snapshots(self, indices_lst):
+    #     selected_snapshots = []
+    #     for idx in indices_lst:
+    #         selected_snapshots.append(self.snapshots[idx])
+    #     return selected_snapshots
 
     def get_traj_num(self):
         return len(self.buffer)
