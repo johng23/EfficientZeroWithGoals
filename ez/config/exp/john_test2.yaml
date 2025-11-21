@@ -146,8 +146,9 @@ model:
   random_type: std   # std, normal, pink, OU
 
   # NEW: Abstract action space dimension
-  abstract_action_dim: 10  # Dimension of abstract action space (smaller than real action space)
+  abstract_action_dim: 8  # Dimension of abstract action space (smaller than real action space)
   injection_hidden_dim: 64  # Hidden dimension for injection network residual blocks
+  abstract_concrete_alignment_samples: 1
 
   # Gamma and realization heads are already part of DynamicsNetwork
   gamma_net_shape: [128]  # Architecture for gamma head (already in DynamicsNetwork)
@@ -175,4 +176,3 @@ actors:
 wandb:
   project: 'ez-v2-release'
   tag: 'DMC-state'
-
